@@ -18,6 +18,15 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # Enable CSI (Channel State Information) in WiFi driver
 CONFIG_ESP_WIFI_CSI_ENABLED=y
 
+# Guarded DATA fallback: start MGMT-only, add DATA if CSI yield collapses,
+# then return to MGMT-only if raw callback pressure is too high on ESP32-S3.
+CONFIG_CSI_DATA_FALLBACK_ENABLE=y
+CONFIG_CSI_DATA_FALLBACK_LOW_YIELD_PPS=2
+CONFIG_CSI_DATA_FALLBACK_RAW_CB_MAX_PPS=80
+CONFIG_CSI_DATA_FALLBACK_ENABLE_AFTER_MS=5000
+CONFIG_CSI_DATA_FALLBACK_MIN_DWELL_MS=10000
+CONFIG_CSI_DATA_FALLBACK_COOLDOWN_MS=30000
+
 # NVS encryption disabled by default (requires eFuse provisioning).
 # Enable only after burning HMAC key to eFuse block.
 # CONFIG_NVS_ENCRYPTION is not set

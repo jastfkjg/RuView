@@ -39,6 +39,53 @@ menu "CSI Node Configuration"
         help
             WiFi channel to listen on for CSI data.
 
+    config CSI_DATA_FALLBACK_ENABLE
+        bool "Enable guarded DATA fallback for CSI capture"
+        default y
+        help
+            Start in MGMT-only promiscuous mode to avoid the ESP32-S3 high-rate
+            DATA crash path, but temporarily add DATA frames when CSI callback
+            yield is too low for sensing. A runtime guard returns to MGMT-only
+            if raw callback pressure becomes excessive.
+
+    config CSI_DATA_FALLBACK_LOW_YIELD_PPS
+        int "CSI yield threshold for enabling DATA fallback (pps)"
+        default 2
+        range 0 50
+        depends on CSI_DATA_FALLBACK_ENABLE
+        help
+            DATA fallback is enabled when processed CSI callbacks per second are
+            less than or equal to this threshold after the startup grace period.
+
+    config CSI_DATA_FALLBACK_RAW_CB_MAX_PPS
+        int "Raw CSI callback pressure limit in DATA mode (pps)"
+        default 80
+        range 10 1000
+        depends on CSI_DATA_FALLBACK_ENABLE
+        help
+            DATA fallback is disabled when raw CSI callback entries per second
+            exceed this threshold for at least the minimum dwell period. This is
+            a guard against the ESP32-S3 WiFi interrupt/cache crash observed on
+            busy LANs.
+
+    config CSI_DATA_FALLBACK_ENABLE_AFTER_MS
+        int "Startup delay before enabling DATA fallback (ms)"
+        default 5000
+        range 1000 60000
+        depends on CSI_DATA_FALLBACK_ENABLE
+
+    config CSI_DATA_FALLBACK_MIN_DWELL_MS
+        int "Minimum DATA fallback dwell before overload disable (ms)"
+        default 10000
+        range 1000 120000
+        depends on CSI_DATA_FALLBACK_ENABLE
+
+    config CSI_DATA_FALLBACK_COOLDOWN_MS
+        int "DATA fallback cooldown after overload disable (ms)"
+        default 30000
+        range 1000 300000
+        depends on CSI_DATA_FALLBACK_ENABLE
+
 endmenu
 
 menu "Edge Intelligence (ADR-039)"

@@ -55,6 +55,7 @@ static bool    s_filter_mac_set = false;
 static const char *TAG = "csi_collector";
 
 static uint32_t s_sequence = 0;
+static uint32_t s_raw_cb_count = 0;
 static uint32_t s_cb_count = 0;
 static uint32_t s_send_ok = 0;
 static uint32_t s_send_fail = 0;
@@ -103,6 +104,137 @@ static uint8_t  s_hop_index   = 0;
 
 /** Handle for the periodic hop timer. NULL when timer is not running. */
 static esp_timer_handle_t s_hop_timer = NULL;
+
+/* ---- Guarded DATA fallback state ---- */
+
+#ifndef CONFIG_CSI_DATA_FALLBACK_LOW_YIELD_PPS
+#define CONFIG_CSI_DATA_FALLBACK_LOW_YIELD_PPS 2
+#endif
+#ifndef CONFIG_CSI_DATA_FALLBACK_RAW_CB_MAX_PPS
+#define CONFIG_CSI_DATA_FALLBACK_RAW_CB_MAX_PPS 80
+#endif
+#ifndef CONFIG_CSI_DATA_FALLBACK_ENABLE_AFTER_MS
+#define CONFIG_CSI_DATA_FALLBACK_ENABLE_AFTER_MS 5000
+#endif
+#ifndef CONFIG_CSI_DATA_FALLBACK_MIN_DWELL_MS
+#define CONFIG_CSI_DATA_FALLBACK_MIN_DWELL_MS 10000
+#endif
+#ifndef CONFIG_CSI_DATA_FALLBACK_COOLDOWN_MS
+#define CONFIG_CSI_DATA_FALLBACK_COOLDOWN_MS 30000
+#endif
+
+static bool s_data_mode_enabled = false;
+static esp_timer_handle_t s_data_guard_timer = NULL;
+static int64_t s_init_us = 0;
+static int64_t s_last_filter_switch_us = 0;
+static int64_t s_last_data_disable_us = 0;
+static int64_t s_last_guard_us = 0;
+static uint32_t s_last_guard_raw_cb = 0;
+static uint32_t s_last_guard_processed_cb = 0;
+
+static csi_data_fallback_policy_t data_fallback_policy(void)
+{
+    csi_data_fallback_policy_t policy = {
+#ifdef CONFIG_CSI_DATA_FALLBACK_ENABLE
+        .enabled = true,
+#else
+        .enabled = false,
+#endif
+        .low_yield_pps = CONFIG_CSI_DATA_FALLBACK_LOW_YIELD_PPS,
+        .raw_cb_max_pps = CONFIG_CSI_DATA_FALLBACK_RAW_CB_MAX_PPS,
+        .enable_after_ms = CONFIG_CSI_DATA_FALLBACK_ENABLE_AFTER_MS,
+        .min_data_dwell_ms = CONFIG_CSI_DATA_FALLBACK_MIN_DWELL_MS,
+        .cooldown_ms = CONFIG_CSI_DATA_FALLBACK_COOLDOWN_MS,
+    };
+    return policy;
+}
+
+static esp_err_t set_promiscuous_data_mode(bool enable_data, const char *reason)
+{
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       (enable_data ? WIFI_PROMIS_FILTER_MASK_DATA : 0),
+    };
+
+    esp_err_t err = esp_wifi_set_promiscuous_filter(&filt);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "promiscuous filter switch failed (%s): %s",
+                 reason ? reason : "no reason", esp_err_to_name(err));
+        return err;
+    }
+
+    s_data_mode_enabled = enable_data;
+    s_last_filter_switch_us = esp_timer_get_time();
+    ESP_LOGW(TAG, "Promiscuous filter now %s (%s)",
+             enable_data ? "MGMT+DATA" : "MGMT-only",
+             reason ? reason : "manual");
+    return ESP_OK;
+}
+
+static void data_guard_timer_cb(void *arg)
+{
+    (void)arg;
+
+    csi_data_fallback_policy_t policy = data_fallback_policy();
+    if (!policy.enabled) {
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (s_last_guard_us == 0) {
+        s_last_guard_us = now_us;
+        s_last_guard_raw_cb = s_raw_cb_count;
+        s_last_guard_processed_cb = s_cb_count;
+        return;
+    }
+
+    int64_t elapsed_us = now_us - s_last_guard_us;
+    if (elapsed_us <= 0) {
+        return;
+    }
+
+    uint32_t raw_delta = s_raw_cb_count - s_last_guard_raw_cb;
+    uint32_t processed_delta = s_cb_count - s_last_guard_processed_cb;
+    uint32_t raw_pps_u32 = (uint32_t)(((uint64_t)raw_delta * 1000000ULL) /
+                                      (uint64_t)elapsed_us);
+    uint32_t processed_pps_u32 = (uint32_t)(((uint64_t)processed_delta * 1000000ULL) /
+                                            (uint64_t)elapsed_us);
+    uint16_t raw_pps = raw_pps_u32 > 0xFFFFu ? 0xFFFFu : (uint16_t)raw_pps_u32;
+    uint16_t processed_pps = processed_pps_u32 > 0xFFFFu
+        ? 0xFFFFu : (uint16_t)processed_pps_u32;
+
+    uint32_t now_ms = (uint32_t)((now_us - s_init_us) / 1000);
+    uint32_t last_switch_ms = (uint32_t)((s_last_filter_switch_us - s_init_us) / 1000);
+    uint32_t last_disable_ms = s_last_data_disable_us == 0
+        ? 0 : (uint32_t)((s_last_data_disable_us - s_init_us) / 1000);
+
+    csi_data_fallback_action_t action = csi_data_fallback_decide(
+        &policy, s_data_mode_enabled, processed_pps, raw_pps,
+        now_ms, last_switch_ms, last_disable_ms);
+
+    if (action == CSI_DATA_FALLBACK_ENABLE_DATA) {
+        if (set_promiscuous_data_mode(true, "low CSI yield fallback") == ESP_OK) {
+            ESP_LOGW(TAG, "DATA fallback armed: processed=%upps raw=%upps "
+                          "low_yield<=%u max_raw=%u",
+                     (unsigned)processed_pps, (unsigned)raw_pps,
+                     (unsigned)policy.low_yield_pps,
+                     (unsigned)policy.raw_cb_max_pps);
+        }
+    } else if (action == CSI_DATA_FALLBACK_DISABLE_DATA) {
+        if (set_promiscuous_data_mode(false, "raw callback pressure guard") == ESP_OK) {
+            s_last_data_disable_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "DATA fallback disabled for %lums cooldown: "
+                          "processed=%upps raw=%upps max_raw=%u",
+                     (unsigned long)policy.cooldown_ms,
+                     (unsigned)processed_pps, (unsigned)raw_pps,
+                     (unsigned)policy.raw_cb_max_pps);
+        }
+    }
+
+    s_last_guard_us = now_us;
+    s_last_guard_raw_cb = s_raw_cb_count;
+    s_last_guard_processed_cb = s_cb_count;
+}
 
 /**
  * Serialize CSI data into ADR-018 binary frame format.
@@ -246,6 +378,7 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
 static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
+    s_raw_cb_count++;
 
     /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
      * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
@@ -464,19 +597,19 @@ void csi_collector_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_cb));
 
-    /* MGMT-only promiscuous filter + active probe injection (RuView#396).
+    s_init_us = esp_timer_get_time();
+    s_last_filter_switch_us = s_init_us;
+
+    /* MGMT-only promiscuous filter with guarded DATA fallback (RuView#396).
      *
      * DATA frames cause 100-500+ WiFi HW interrupts/sec which crashes Core 0
      * in wDev_ProcessFiq (SPI flash cache race in ESP-IDF WiFi blob).
-     * MGMT-only gives ~10 Hz (beacons). Probe request injection at 10 Hz
-     * adds ~10 Hz probe responses from APs → ~20 Hz total, matching the
-     * edge processing designed sample rate of 20 Hz. */
-    wifi_promiscuous_filter_t filt = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
+     * Start safe in MGMT-only, then temporarily add DATA only if the observed
+     * CSI yield collapses. A guard timer disables DATA again when raw callback
+     * pressure gets too high. */
+    ESP_ERROR_CHECK(set_promiscuous_data_mode(false, "safe startup"));
 
-    ESP_LOGI(TAG, "Promiscuous mode enabled (MGMT-only, RuView#396)");
+    ESP_LOGI(TAG, "Promiscuous mode enabled (MGMT-only startup, guarded DATA fallback)");
 
 #if CONFIG_SOC_WIFI_HE_SUPPORT
     /* Wi-Fi 6 targets (e.g. ESP32-C6): wifi_csi_config_t is wifi_csi_acquire_config_t
@@ -516,6 +649,37 @@ void csi_collector_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_callback, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+
+    csi_data_fallback_policy_t policy = data_fallback_policy();
+    if (policy.enabled) {
+        esp_timer_create_args_t timer_args = {
+            .callback = data_guard_timer_cb,
+            .arg = NULL,
+            .name = "csi_data_guard",
+        };
+        esp_err_t guard_err = esp_timer_create(&timer_args, &s_data_guard_timer);
+        if (guard_err == ESP_OK) {
+            guard_err = esp_timer_start_periodic(s_data_guard_timer, 1000000ULL);
+        }
+        if (guard_err != ESP_OK) {
+            ESP_LOGW(TAG, "DATA fallback guard timer disabled: %s",
+                     esp_err_to_name(guard_err));
+            if (s_data_guard_timer != NULL) {
+                esp_timer_delete(s_data_guard_timer);
+                s_data_guard_timer = NULL;
+            }
+        } else {
+            ESP_LOGI(TAG, "DATA fallback guard enabled: low_yield<=%upps "
+                          "raw_max=%upps enable_after=%lums dwell=%lums cooldown=%lums",
+                     (unsigned)policy.low_yield_pps,
+                     (unsigned)policy.raw_cb_max_pps,
+                     (unsigned long)policy.enable_after_ms,
+                     (unsigned long)policy.min_data_dwell_ms,
+                     (unsigned long)policy.cooldown_ms);
+        }
+    } else {
+        ESP_LOGI(TAG, "DATA fallback guard disabled by Kconfig");
+    }
 
     if (g_nvs_config.filter_mac_set) {
         ESP_LOGI(TAG, "MAC filter active: %02x:%02x:%02x:%02x:%02x:%02x",

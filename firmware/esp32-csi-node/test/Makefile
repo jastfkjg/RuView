@@ -43,9 +43,9 @@ MAIN_DIR  = ../main
 FUZZ_DURATION ?= 30
 FUZZ_JOBS     ?= 1
 
-.PHONY: all clean run_serialize run_edge run_nvs run_all test_adr110 run_adr110 host_tests
+.PHONY: all clean run_serialize run_edge run_nvs run_all test_adr110 run_adr110 test_csi_data_fallback run_csi_data_fallback host_tests
 
-all: fuzz_serialize fuzz_edge fuzz_nvs test_adr110
+all: fuzz_serialize fuzz_edge fuzz_nvs test_adr110 test_csi_data_fallback
 
 # --- ADR-110 encoding unit tests ---
 # Host-side, no libFuzzer needed — plain C99 deterministic table tests
@@ -57,8 +57,22 @@ test_adr110: test_adr110_encoding.c
 run_adr110: test_adr110
 	./test_adr110
 
-host_tests: run_adr110
-	@echo "ADR-110 host tests passed"
+test_csi_data_fallback: test_csi_data_fallback.c $(MAIN_DIR)/csi_data_fallback.c
+	cc -std=c99 -Wall -Wextra -Istubs -I../main \
+	   -DCONFIG_CSI_NODE_ID=1 \
+	   -DCONFIG_CSI_WIFI_CHANNEL=6 \
+	   -DCONFIG_CSI_WIFI_SSID=\"test\" \
+	   -DCONFIG_CSI_TARGET_IP=\"192.168.1.1\" \
+	   -DCONFIG_CSI_TARGET_PORT=5500 \
+	   -DCONFIG_ESP_WIFI_CSI_ENABLED=1 \
+	   -DCONFIG_CSI_FRAME_HE_TAGGING=1 \
+	   $^ -o $@ -lm
+
+run_csi_data_fallback: test_csi_data_fallback
+	./test_csi_data_fallback
+
+host_tests: run_adr110 run_csi_data_fallback
+	@echo "CSI firmware host tests passed"
 
 # --- Serialize fuzzer ---
 # Tests csi_serialize_frame() with random wifi_csi_info_t inputs.
@@ -94,5 +108,5 @@ run_nvs: fuzz_nvs
 run_all: run_serialize run_edge run_nvs
 
 clean:
-	rm -f fuzz_serialize fuzz_edge fuzz_nvs test_adr110
-	rm -rf corpus_serialize/ corpus_edge/ corpus_nvs/
+	rm -f fuzz_serialize fuzz_edge fuzz_nvs test_adr110 test_csi_data_fallback
+	rm -rf corpus_serialize/ corpus_edge/ corpus_nvs/ *.dSYM

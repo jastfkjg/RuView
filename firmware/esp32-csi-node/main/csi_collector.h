@@ -61,6 +61,44 @@ uint8_t csi_collector_get_node_id(void);
  */
 size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf_len);
 
+/** Guarded DATA fallback runtime policy. */
+typedef struct {
+    bool     enabled;             /**< Enable automatic MGMT-only -> MGMT+DATA fallback. */
+    uint16_t low_yield_pps;       /**< Enable DATA when processed CSI yield is <= this. */
+    uint16_t raw_cb_max_pps;      /**< Disable DATA when raw callback pressure exceeds this. */
+    uint32_t enable_after_ms;     /**< Startup grace period before DATA fallback may enable. */
+    uint32_t min_data_dwell_ms;   /**< Minimum time to stay in DATA mode before disabling. */
+    uint32_t cooldown_ms;         /**< Cooldown after DATA overload before re-enabling DATA. */
+} csi_data_fallback_policy_t;
+
+/** Action emitted by csi_data_fallback_decide(). */
+typedef enum {
+    CSI_DATA_FALLBACK_KEEP = 0,
+    CSI_DATA_FALLBACK_ENABLE_DATA,
+    CSI_DATA_FALLBACK_DISABLE_DATA,
+} csi_data_fallback_action_t;
+
+/**
+ * Pure decision function for guarded DATA fallback.
+ *
+ * @param policy               Policy thresholds.
+ * @param data_mode_enabled    Current promiscuous filter includes DATA.
+ * @param processed_yield_pps  CSI callbacks that survived software gates.
+ * @param raw_cb_pps           CSI callback entries before software rate gates.
+ * @param now_ms               Monotonic time in milliseconds.
+ * @param last_switch_ms       Last promiscuous filter switch time in ms.
+ * @param last_data_disable_ms Last DATA-disable time in ms, or 0 if never.
+ * @return Filter action to apply.
+ */
+csi_data_fallback_action_t csi_data_fallback_decide(
+    const csi_data_fallback_policy_t *policy,
+    bool data_mode_enabled,
+    uint16_t processed_yield_pps,
+    uint16_t raw_cb_pps,
+    uint32_t now_ms,
+    uint32_t last_switch_ms,
+    uint32_t last_data_disable_ms);
+
 /**
  * Configure the channel-hop table for multi-band sensing (ADR-029).
  *
